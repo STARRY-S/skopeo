@@ -12,6 +12,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"sync/atomic"
 
@@ -34,7 +35,6 @@ import (
 	digest "github.com/opencontainers/go-digest"
 	imgspecv1 "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/sirupsen/logrus"
-	"golang.org/x/exp/slices"
 )
 
 var (
@@ -59,7 +59,7 @@ type storageImageDestination struct {
 	nextTempFileID        atomic.Int32             // A counter that we use for computing filenames to assign to blobs
 	manifest              []byte                   // Manifest contents, temporary
 	manifestDigest        digest.Digest            // Valid if len(manifest) != 0
-	untrustedDiffIDValues []digest.Digest          // From config’s RootFS.DiffIDs, valid if not nil
+	untrustedDiffIDValues []digest.Digest          // From config’s RootFS.DiffIDs (not even validated to be valid digest.Digest!); or nil if not read yet
 	signatures            []byte                   // Signature contents, temporary
 	signatureses          map[digest.Digest][]byte // Instance signature contents, temporary
 	metadata              storageImageMetadata     // Metadata contents being built
@@ -361,6 +361,18 @@ func (s *storageImageDestination) TryReusingBlobWithOptions(ctx context.Context,
 // tryReusingBlobAsPending implements TryReusingBlobWithOptions for (blobDigest, size or -1), filling s.blobDiffIDs and other metadata.
 // The caller must arrange the blob to be eventually committed using s.commitLayer().
 func (s *storageImageDestination) tryReusingBlobAsPending(blobDigest digest.Digest, size int64, options *private.TryReusingBlobOptions) (bool, private.ReusedBlob, error) {
+	if blobDigest == "" {
+		return false, private.ReusedBlob{}, errors.New(`Can not check for a blob with unknown digest`)
+	}
+	if err := blobDigest.Validate(); err != nil {
+		return false, private.ReusedBlob{}, fmt.Errorf("Can not check for a blob with invalid digest: %w", err)
+	}
+	if options.TOCDigest != "" {
+		if err := options.TOCDigest.Validate(); err != nil {
+			return false, private.ReusedBlob{}, fmt.Errorf("Can not check for a blob with invalid digest: %w", err)
+		}
+	}
+
 	// lock the entire method as it executes fairly quickly
 	s.lock.Lock()
 	defer s.lock.Unlock()
@@ -377,18 +389,6 @@ func (s *storageImageDestination) tryReusingBlobAsPending(blobDigest digest.Dige
 				Digest: blobDigest,
 				Size:   aLayer.CompressedSize(),
 			}, nil
-		}
-	}
-
-	if blobDigest == "" {
-		return false, private.ReusedBlob{}, errors.New(`Can not check for a blob with unknown digest`)
-	}
-	if err := blobDigest.Validate(); err != nil {
-		return false, private.ReusedBlob{}, fmt.Errorf("Can not check for a blob with invalid digest: %w", err)
-	}
-	if options.TOCDigest != "" {
-		if err := options.TOCDigest.Validate(); err != nil {
-			return false, private.ReusedBlob{}, fmt.Errorf("Can not check for a blob with invalid digest: %w", err)
 		}
 	}
 
@@ -767,7 +767,13 @@ func (s *storageImageDestination) createNewLayer(index int, layerDigest digest.D
 				logrus.Debugf("Skipping commit for layer %q, manifest not yet available", newLayerID)
 				return nil, nil
 			}
+
 			untrustedUncompressedDigest = d
+			// While the contents of the digest are untrusted, make sure at least the _format_ is valid,
+			// because we are going to write it to durable storage in expectedLayerDiffIDFlag .
+			if err := untrustedUncompressedDigest.Validate(); err != nil {
+				return nil, err
+			}
 		}
 
 		flags := make(map[string]interface{})
@@ -930,7 +936,6 @@ func (s *storageImageDestination) untrustedLayerDiffID(layerIndex int) (digest.D
 	// nothing is writing to s.manifest yet, or PutManifest has been called and s.manifest != nil.
 	// Either way this function does not need the protection of s.lock.
 	if s.manifest == nil {
-		logrus.Debugf("Skipping commit for layer %d, manifest not yet available", layerIndex)
 		return "", nil
 	}
 
@@ -1070,8 +1075,12 @@ func (s *storageImageDestination) Commit(ctx context.Context, unparsedToplevel t
 		if err != nil {
 			return fmt.Errorf("digesting top-level manifest: %w", err)
 		}
+		key, err := manifestBigDataKey(manifestDigest)
+		if err != nil {
+			return err
+		}
 		options.BigData = append(options.BigData, storage.ImageBigDataOption{
-			Key:    manifestBigDataKey(manifestDigest),
+			Key:    key,
 			Data:   toplevelManifest,
 			Digest: manifestDigest,
 		})
@@ -1079,8 +1088,12 @@ func (s *storageImageDestination) Commit(ctx context.Context, unparsedToplevel t
 	// Set up to save the image's manifest.  Allow looking it up by digest by using the key convention defined by the Store.
 	// Record the manifest twice: using a digest-specific key to allow references to that specific digest instance,
 	// and using storage.ImageDigestBigDataKey for future users that don’t specify any digest and for compatibility with older readers.
+	key, err := manifestBigDataKey(s.manifestDigest)
+	if err != nil {
+		return err
+	}
 	options.BigData = append(options.BigData, storage.ImageBigDataOption{
-		Key:    manifestBigDataKey(s.manifestDigest),
+		Key:    key,
 		Data:   s.manifest,
 		Digest: s.manifestDigest,
 	})
@@ -1098,8 +1111,12 @@ func (s *storageImageDestination) Commit(ctx context.Context, unparsedToplevel t
 		})
 	}
 	for instanceDigest, signatures := range s.signatureses {
+		key, err := signatureBigDataKey(instanceDigest)
+		if err != nil {
+			return err
+		}
 		options.BigData = append(options.BigData, storage.ImageBigDataOption{
-			Key:    signatureBigDataKey(instanceDigest),
+			Key:    key,
 			Data:   signatures,
 			Digest: digest.Canonical.FromBytes(signatures),
 		})
@@ -1189,7 +1206,7 @@ func (s *storageImageDestination) PutManifest(ctx context.Context, manifestBlob 
 	if err != nil {
 		return err
 	}
-	s.manifest = slices.Clone(manifestBlob)
+	s.manifest = bytes.Clone(manifestBlob)
 	s.manifestDigest = digest
 	return nil
 }
